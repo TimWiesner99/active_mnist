@@ -10,6 +10,7 @@ sampler = Active_MNIST(image_path='./data/train-images.idx3-ubyte', label_path='
 original_img, transformed_img, labels, transforms = sampler.sample(10)
 sampler.plot_example(original_img, transformed_img, labels, transforms)
 ```
+![image](https://user-images.githubusercontent.com/62284314/142396652-2feece30-9b0d-4149-b805-a2b448600151.png)
 
 The dataset is loaded when the class is initialized. You can then keep sampling new images from the dataset. 
 
