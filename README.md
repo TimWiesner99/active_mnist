@@ -1,5 +1,5 @@
-# active_mnist
-Small program that let's you sample from the MNIST handwritten digits dataset, but with random rotation, scaling and translation transformations applied.
+# The *Active MNIST* data loader
+Small program that let's you sample from the MNIST handwritten digits dataset (Deng, 2012), but with random rotation, scaling and translation transformations applied.
 
 The class can (for example) be used in the following way:
 ```
@@ -45,3 +45,6 @@ set_translation(mean=0, std=10)
 ```
 
 This should be done *after* initialization of the class, but *before* calling `sample()` or `load_data()`.
+
+### References:
+Deng, L. (2012). The mnist database of handwritten digit images for machine learning research. IEEE Signal Processing Magazine, 29(6), 141–142.
