@@ -1,9 +1,28 @@
 import math
+import warnings
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import idx2numpy
-from PIL import Image
+import torch
+import torch.nn.functional as func
+import torchvision.transforms
+
+
+def flatten_channel_dim(imgs):
+    imgs = imgs.cpu()
+    return torch.reshape(imgs, [imgs.shape[0], imgs.shape[2], imgs.shape[3]])
+
+
+def to_one_hot(y, dims=10, dtype=torch.FloatTensor):
+    out = torch.zeros((len(y), dims)).type(dtype)
+    y = y.type(torch.LongTensor)
+
+    for i in range(len(out)):
+        out[i, y[i]] = 1
+
+    return out
 
 
 def plot_example(original_images, transformed_images, labels, transforms, number_examples=1):
@@ -12,112 +31,263 @@ def plot_example(original_images, transformed_images, labels, transforms, number
 
     for i in range(number_examples):
         fig, axs = plt.subplots(ncols=2, figsize=(6, 3))
-        axs[0].imshow(original_images[i], cmap=cm.gray_r)
+        axs[0].imshow(flatten_channel_dim(original_images)[i], cmap=cm.gray_r)
         axs[0].set_title('Original MNIST Figure')
-        axs[1].imshow(transformed_images[i], cmap=cm.gray_r)
+        axs[1].imshow(flatten_channel_dim(transformed_images)[i], cmap=cm.gray_r)
         axs[1].set_title('Transformed MNIST Figure')
-        description = f'Label = {labels[i]}\n' \
-                      f'Scale = {transforms[i, 0:2]}\n' \
-                      f'Rotation = {transforms[i, 2]:.2f} ({transforms[i, 2] / math.pi:.3f}π)\n' \
-                      f'Translation = {transforms[i, 3:6]}'
+        axs[0].set_xticks([])
+        axs[0].set_yticks([])
+        axs[1].set_xticks([])
+        axs[1].set_yticks([])
+
+        label = torch.where(labels[i] == 1)[0]
+
+        description = f'Label = {label.data.cpu().numpy()}\n' \
+                      f'Scale = {transforms[i, 0:2].data.cpu().numpy()}\n' \
+                      f'Rotation = {transforms[i, 2].data.cpu().numpy() / math.pi:.3f}π\n' \
+                      f'Translation = {transforms[i, 3:6].data.cpu().numpy()}'
         plt.text(0.95, 0.5, description, fontsize=14, transform=plt.gcf().transFigure)
         plt.show()
 
 
 class Active_MNIST:
 
-    def __init__(self, image_path, label_path):
-        self.image_path = image_path
-        self.label_path = label_path
+    def __init__(self, image_path, label_path, batch_size=1024, max_iterations=64,
+                 n_of_each=None, size=56, shuffle=True, dtype=None):
 
-        self.images = idx2numpy.convert_from_file(self.image_path)
-        self.labels = idx2numpy.convert_from_file(self.label_path)
+        if dtype is None:
+            self.dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+        else:
+            self.dtype = dtype
 
-    def sample(self, N, desired_labels=np.array(range(10)), min_scale=0.5, max_scale=2, min_rotation=0, max_rotation=math.pi, min_translation=0,
-               max_translation=20):
-        """
+        self.shuffle = shuffle
 
-        :param N: number of samples
-        :param desired_labels: array of int, only returns transformed digits of given class(es)
-        :param min_scale: minimum scaling, both dimensions
-        :param max_scale: maximum scaling, both dimensions
-        :param min_rotation: minimum rotation
-        :param max_rotation: maximum rotation
-        :param min_translation: minimum translation, both dimensions
-        :param max_translation: maximum translation, both dimensions
-        :return:
-        """
+        images = idx2numpy.convert_from_file(image_path)
+        labels = idx2numpy.convert_from_file(label_path)
 
-        assert min_rotation >= 0
-        assert max_rotation >= 0
-        assert min_scale > 0
+        if n_of_each is not None:
+            images_filtered = np.empty(shape=(n_of_each * 10, 28, 28), dtype=None)
+            labels_filtered = np.zeros(shape=n_of_each * 10)
 
-        def enlarge(image, shape=(56, 56)):
-            h, w = image.shape
-            top = (shape[0] - h) // 2
-            left = (shape[1] - w) // 2
+            for i in range(10):
+                imgs_tmp = images[labels == i]
+                indices = np.random.randint(0, len(imgs_tmp), size=n_of_each)
+                images_filtered[i * n_of_each:(i + 1) * n_of_each] = imgs_tmp[indices]
+                labels_filtered[i * n_of_each:(i + 1) * n_of_each] = np.ones(shape=n_of_each) * i
 
-            out = np.zeros(shape)
-            out[top:top + h, left:left + w] = image
+            images = images_filtered
+            labels = labels_filtered
 
+        # add channel dimension
+        self.images = torch.Tensor(np.reshape(images, [images.shape[0], 1, images.shape[1], images.shape[2]]))
+        self.labels = torch.Tensor(labels)
+
+        # shuffle
+        indices = torch.randperm(len(self.images))
+        self.images = self.images[indices]
+        self.labels = self.labels[indices]
+
+        self.batch_size = batch_size
+        self.max_iterations = max_iterations
+        self.iter = 0
+
+        self.n_of_each = n_of_each
+        self.size = size
+
+        self.mean_scale = 1
+        self.std_scale = 0.25
+        self.mean_rotation = 0
+        self.std_rotation = math.pi / 2
+        self.mean_translation = 0
+        self.std_translation = 0.25
+
+        self.or_img = None
+        self.trns_img = None
+        self.lbl = None
+        self.trns = None
+
+        print(f'Active MNIST Dataloader initialized on {self.dtype}\n'
+              f'batch_size = {self.batch_size}, iterations = {self.max_iterations}')
+
+    def load_data(self, perc_normal=0.0, perc_distractors=0.0):
+        del self.or_img, self.trns_img, self.lbl, self.trns
+        if self.dtype == torch.cuda.FloatTensor:
+            torch.cuda.empty_cache()
+
+        print(f'Sampling {self.batch_size * self.max_iterations} images...')
+        print(f' {(1 - (perc_normal + perc_distractors)) * 100}% transformed\n {(perc_distractors) * 100}% distractors\n {(perc_normal) * 100}% normal.')
+        self.or_img, self.trns_img, self.lbl, self.trns = self.sample(n=self.batch_size * self.max_iterations,
+                                                                      perc_normal=perc_normal,
+                                                                      perc_distractors=perc_distractors)
+        if self.shuffle:
+            self.shuffle_data()
+        print(f'Finished sampling. Loaded {self.batch_size * self.max_iterations} images into {self.dtype}.')
+
+    def set_scale(self, mean=1, std=1):
+        self.mean_scale = mean
+        self.std_scale = std
+
+    def set_rotation(self, mean=0, std=math.pi / 2):
+        self.mean_rotation = mean
+        self.std_rotation = std
+
+    def set_translation(self, mean=0, std=10):
+        self.mean_translation = mean
+        self.std_translation = std
+
+    def shuffle_data(self):
+        assert self.or_img is not None
+        assert self.trns_img is not None
+        assert self.lbl is not None
+        assert self.trns is not None
+
+        indices = torch.randperm(len(self.or_img))
+        self.or_img = self.or_img[indices]
+        self.trns_img = self.trns_img[indices]
+        self.lbl = self.lbl[indices]
+        self.trns = self.trns[indices]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        assert self.or_img is not None, 'Call load_data() before iterating!'
+
+        if self.iter < self.max_iterations:
+            out = self.or_img[self.iter * self.batch_size: (self.iter + 1) * self.batch_size], \
+                  self.trns_img[self.iter * self.batch_size: (self.iter + 1) * self.batch_size], \
+                  self.lbl[self.iter * self.batch_size: (self.iter + 1) * self.batch_size], \
+                  self.trns[self.iter * self.batch_size: (self.iter + 1) * self.batch_size]
+            self.iter += 1
             return out
+        else:
+            self.iter = 0
+            if self.shuffle:
+                self.shuffle_data()
+            raise StopIteration
 
-        def transformation_matrix(transform=[1, 1, 0, 0, 0], shape=(56, 56)):
-            # translate to center
-            T_center = np.array([[1, 0, -shape[0] // 2],
-                                 [0, 1, -shape[1] // 2],
-                                 [0, 0, 1]])
+    def sample(self, n=1, perc_normal=0.0, perc_distractors=0.0):
+        assert 0.0 <= perc_normal + perc_distractors <= 1, \
+            'Percentage of normal/untransformed + distractor images must be between 0 and 1!'
+
+        def transformation_matrix(transform=[1, 1, 0, 0, 0]):
             # scale
-            T_scale = np.array([[transform[0], 0, 0],
-                                [0, transform[1], 0],
-                                [0, 0, 1]])
+            T_scale = torch.Tensor([[transform[0], 0, 0],
+                                    [0, transform[1], 0],
+                                    [0, 0, 1]]).type(self.dtype)
             # rotation
-            T_rot = np.array([[np.cos(transform[2]), np.sin(transform[2]), 0],
-                              [-np.sin(transform[2]), np.cos(transform[2]), 0],
-                              [0, 0, 1]])
+            T_rot = torch.Tensor([[torch.cos(transform[2]), -torch.sin(transform[2]), 0],
+                                  [torch.sin(transform[2]), torch.cos(transform[2]), 0],
+                                  [0, 0, 1]]).type(self.dtype)
+
             # translation
-            T_trans = np.array([[1, 0, transform[3]],
-                                [0, 1, transform[4]],
-                                [0, 0, 1]])
-            # translate back to original space
-            T_decenter = np.array([[1, 0, (shape[0] // 2)],
-                                   [0, 1, (shape[1] // 2)],
-                                   [0, 0, 1]])
+            T_trans = torch.Tensor([[1, 0, transform[3]],
+                                    [0, 1, transform[4]],
+                                    [0, 0, 1]]).type(self.dtype)
+
             # combine matrices
-            T = T_decenter @ T_trans @ T_rot @ T_scale @ T_center
-            T_inv = np.linalg.inv(T)
-            return T_inv
+            T = T_trans @ T_rot @ T_scale
+            T_inv = torch.linalg.inv(T).type(self.dtype)
+            return T_inv[0:2, :]
 
-        indices_filtered = [i for i in range(len(self.labels)) if self.labels[i] in desired_labels]
-        index = np.random.choice(indices_filtered, size=N, replace=True)
+        n_normal = int(n * perc_normal)
+        n_distractors = int(n * perc_distractors)
+        n_transformed = int(n - (n_normal + perc_distractors))
 
-        if not min_scale == max_scale:
-            scales = np.random.randint(min_scale * 100, max_scale * 100, (N, 2)) / 100
+        print('     Sampling indices')
+        index_trns = np.random.choice(len(self.labels), size=n_transformed, replace=True)
+        index_normal = np.random.choice(len(self.labels), size=n_normal, replace=True)
+        index_dist = np.random.choice(len(self.labels), size=n_distractors, replace=True)
+
+        print('     Creating random transformation values')
+        if n_transformed > 0:
+            scales = torch.Tensor(np.abs(np.random.normal(loc=self.mean_scale,
+                                                          scale=self.std_scale,
+                                                          size=(n_transformed, 2)))).type(self.dtype)
+            rotations = torch.Tensor((np.random.normal(loc=self.mean_rotation,
+                                                       scale=self.std_rotation,
+                                                       size=(n_transformed, 1))
+                                      % math.pi)
+                                     * np.random.choice([-1, 1])).type(self.dtype)
+            translations = torch.Tensor(np.random.normal(loc=self.mean_translation,
+                                                         scale=self.std_translation,
+                                                         size=(n_transformed, 2))).type(self.dtype)
+
+            trns = torch.cat((scales, rotations, translations), dim=1).type(self.dtype)
         else:
-            scales = np.zeros((N, 2)) + min_scale
+            trns = torch.zeros(n_transformed, 5).type(self.dtype)
 
-        if not min_rotation == max_rotation:
-            rotations = np.random.randint(abs(min_rotation) * 100, max_rotation * 100, N) * np.random.choice([-1, 1],
-                                                                                                             N) / 100 % (
-                                    2 * math.pi)
+        if n_distractors > 0:
+            scales = torch.Tensor(np.abs(np.random.normal(loc=1, scale=0.25,
+                                                          size=(n_distractors, 2)))).type(self.dtype)
+            rotations = torch.Tensor((np.random.normal(loc=0, scale=math.pi/2,
+                                                       size=(n_distractors, 1))
+                                      % math.pi)
+                                     * np.random.choice([-1, 1])).type(self.dtype)
+            translations = torch.Tensor(np.random.normal(loc=0, scale=10,
+                                                         size=(n_distractors, 2))).type(self.dtype)
+
+            trns_dist = torch.cat((scales, rotations, translations), dim=1).type(self.dtype)
         else:
-            rotations = np.zeros(N) + min_rotation
+            trns_dist = torch.zeros(n_distractors, 5).type(self.dtype)
 
-        if not min_translation == max_translation:
-            translations = np.random.randint(min_translation, max_translation, (N, 2)) * np.random.choice([-1, 1],
-                                                                                                          (N, 2))
+        trns_normal = torch.zeros(n_normal, 5).type(self.dtype)
+
+        # select images and labels based on indices, only copy these to *device* (not whole dataset)
+        selected_imgs_trns = self.images[index_trns].type(self.dtype)  # also normalizes to 0-1 range
+        lbl_trns = to_one_hot(torch.Tensor(self.labels[index_trns]).type(self.dtype), dtype=self.dtype)
+
+        selected_imgs_dist = self.images[index_dist].type(self.dtype)
+        lbl_dist = func.softmax(
+            torch.add(
+                torch.add(
+                    torch.randn(size=[n_distractors, 10]).type(self.dtype),
+                    to_one_hot(torch.Tensor(self.labels[index_dist]).type(self.dtype), dtype=self.dtype),
+                    alpha=2),
+                10)/10
+            , dim=1)  # makes class distribution mostly flat with a bit of noise and a small peak at true label
+
+
+        selected_imgs_normal = self.images[index_normal].type(self.dtype)
+        lbl_normal = to_one_hot(torch.Tensor(self.labels[index_normal]).type(self.dtype), dtype=self.dtype)
+
+        # padding images
+        print('     Padding images')
+        or_img_trns = torchvision.transforms.Pad(padding=(self.size - self.images.shape[2]) // 2)(selected_imgs_trns)
+        or_img_normal = torchvision.transforms.Pad(padding=(self.size - self.images.shape[2]) // 2)(
+            selected_imgs_normal)
+        or_img_dist = torchvision.transforms.Pad(padding=(self.size - self.images.shape[2]) // 2)(
+            selected_imgs_dist)
+
+        # transforming images
+        if n_transformed > 0:
+            print('     Transforming images')
+            trns_matrices = torch.stack([transformation_matrix(t) for t in trns]).type(self.dtype)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                grid = func.affine_grid(trns_matrices, or_img_trns.size()).type(self.dtype)
+                trns_img_trns = func.grid_sample(or_img_trns, grid).type(self.dtype)
         else:
-            translations = np.zeros((N, 2)) + min_translation
+            trns_img_trns = torch.zeros((self.batch_size, 1, self.size, self.size)).type(self.dtype)
 
-        trns = np.c_[scales, rotations, translations]
-        lbl = np.array(self.labels[index])
+        if n_distractors > 0:
+            print('     Transforming distractors')
+            trns_matrices = torch.stack([transformation_matrix(t) for t in trns_dist]).type(self.dtype)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                grid = func.affine_grid(trns_matrices, or_img_dist.size()).type(self.dtype)
+                trns_img_dist = func.grid_sample(or_img_dist, grid).type(self.dtype)
+        else:
+            trns_img_dist = torch.zeros((n_distractors, 1, self.size, self.size)).type(self.dtype)
 
-        or_img = np.array([enlarge(image) for image in self.images[index]])
-        trns_matrices = [transformation_matrix(t) for t in trns]
 
-        trns_img = np.array([np.array(
-            Image.fromarray(image).transform(image.shape, Image.AFFINE, data=trans_matrix.flatten()[:6],
-                                             resample=Image.BILINEAR))
-                             for image, trans_matrix in zip(or_img, trns_matrices)])
+        trns_img_normal = torch.clone(or_img_normal).type(self.dtype)
 
-        return or_img, trns_img, lbl, trns
+        # concatenating transformed, distractor and normal data
+        or_img_trns = torch.concat((or_img_normal, or_img_trns, or_img_dist), dim=0).type(self.dtype)
+        trns_img_trns = torch.concat((trns_img_normal, trns_img_trns, trns_img_dist), dim=0).type(self.dtype)
+        lbl_trns = torch.concat((lbl_normal, lbl_trns, lbl_dist), dim=0).type(self.dtype)
+        trns = torch.concat((trns_normal, trns, trns_dist), dim=0).type(self.dtype)
+        # Using "trns" variables to save gpu memory. Those usually make up the majority.
+
+        return or_img_trns, trns_img_trns, lbl_trns, trns
