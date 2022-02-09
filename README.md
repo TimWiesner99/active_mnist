@@ -16,13 +16,15 @@ dataloader = Active_MNIST(image_path='../data/train-images.idx3-ubyte',
 or_img, trns_img, lbl, pose = dataloader.sample(100)
 plot_example(or_img, trns_img, lbl, pose, number_examples=3)
 ```
-![index](https://user-images.githubusercontent.com/62284314/142396995-510d546e-ae6c-4e26-a382-49d8132118ae.jpg)
+
 
 The dataset is loaded when the class is initialized with `batch_size * max_iterations` samples.
 
 The `sample()` function returns the original images, the transformed images, the labels and a vector containing the transformations. The transformations vector contains five numbers, which are: x-scaling, y-scaling, rotation, x-translation, y-translation.
 
 The `plot_example()` function takes the four arrays returned by the `sample()` function as input and plots one example by default. A larger number of examples can also be printed, as specified by the `number_examples` argument. 
+
+![active_mnist_examples](https://user-images.githubusercontent.com/62284314/153229967-03b5a390-1ede-4a9a-9964-682b0f146d75.png)
 
 It is also possible to use the class as an iterator in a machine learning training loop, as shown below:
 
