@@ -42,10 +42,10 @@ def plot_example(original_images, transformed_images, labels, transforms, number
 
         label = torch.where(labels[i] == 1)[0]
 
-        description = f'Label = {label.data.cpu().numpy()}\n' \
-                      f'Scale = {transforms[i, 0:2].data.cpu().numpy()}\n' \
+        description = f'Label = {label.data.cpu().numpy()[0]}\n' \
+                      f'Scale = {transforms[i, 0].data.cpu().numpy():.3f}x {transforms[i, 1].data.cpu().numpy():.3f}y\n' \
                       f'Rotation = {transforms[i, 2].data.cpu().numpy() / math.pi:.3f}π\n' \
-                      f'Translation = {transforms[i, 3:6].data.cpu().numpy()}'
+                      f'Translation = {transforms[i, 3].data.cpu().numpy():.3f}x {transforms[i, 4].data.cpu().numpy():.3f}y'
         plt.text(0.95, 0.5, description, fontsize=14, transform=plt.gcf().transFigure)
         plt.show()
 
